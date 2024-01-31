@@ -4,6 +4,7 @@ import (
 	"context"
 	"embed"
 	"fmt"
+	"github.com/glasskube/glasskube/internal/cliutils"
 	"github.com/glasskube/glasskube/pkg/client"
 	"github.com/glasskube/glasskube/pkg/install"
 	"github.com/glasskube/glasskube/pkg/list"
@@ -13,8 +14,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	"net/http"
 	"os"
-	"os/exec"
-	"runtime"
 )
 
 var Host = "localhost"
@@ -89,26 +88,11 @@ func Start(ctx context.Context, support *ServerConfigSupport) error {
 	bindAddr := fmt.Sprintf("%v:%d", Host, Port)
 	url := fmt.Sprintf("http://%v", bindAddr)
 	fmt.Printf("glasskube UI is available at %v\n", url)
-	_ = openInBrowser(url)
+	_ = cliutils.OpenInBrowser(url)
 
 	err = http.ListenAndServe(bindAddr, nil)
 	if err != nil {
 		return err
 	}
 	return nil
-}
-
-func openInBrowser(url string) error {
-	var err error
-	switch runtime.GOOS {
-	case "linux":
-		err = exec.Command("xdg-open", url).Start()
-	case "windows":
-		err = exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
-	case "darwin":
-		err = exec.Command("open", url).Start()
-	default:
-		err = fmt.Errorf("unsupported platform")
-	}
-	return err
 }
