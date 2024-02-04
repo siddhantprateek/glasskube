@@ -1,16 +1,19 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	"embed"
 	"fmt"
 	"html/template"
+	"io"
 	"io/fs"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"runtime"
+	"sync"
 	"syscall"
 
 	"github.com/glasskube/glasskube/internal/cliutils"
@@ -23,12 +26,19 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 )
 
-var Host = "localhost"
-var Port = 8580
+var (
+	baseTemplate    *template.Template
+	pkgsPageTmpl    *template.Template
+	supportPageTmpl *template.Template
+	installBtnTmpl  *template.Template
 
-//go:embed root
-//go:embed templates
-var embededFs embed.FS
+	//go:embed root
+	//go:embed templates
+	embededFs embed.FS
+
+	Host = "localhost"
+	Port = 8580
+)
 
 type ServerConfigSupport struct {
 	KubeconfigMissing         bool
@@ -38,26 +48,143 @@ type ServerConfigSupport struct {
 	BootstrapCheckError       error
 }
 
-func Start(ctx context.Context, support *ServerConfigSupport) error {
-	pkgTemplate, err := template.ParseFS(embededFs, "templates/packages.html")
+type server struct {
+	messageChan  chan string
+	pastMessages []string
+	mutex        sync.Mutex
+	hub          *Hub
+}
+
+func (s *server) events(w http.ResponseWriter, r *http.Request) {
+	name := r.Header.Get("User-Agent")
+	client, err := NewClient(s.hub, w, r, name)
 	if err != nil {
-		return err
-	}
-	supportTemplate, err := template.ParseFS(embededFs, "templates/support.html")
-	if err != nil {
-		return err
+		fmt.Printf("Failed to create WebSocket client: %v", err)
+		return
 	}
 
+	s.hub.Register <- client
+
+	go client.WritePump()
+	go client.ReadPump()
+}
+
+func getButtonId(pkgName string) string {
+	return fmt.Sprintf("install-%v", pkgName)
+}
+
+func getSwap(buttonId string) string {
+	return fmt.Sprintf("outerHTML:#%s", buttonId)
+}
+
+func init() {
+	templateFuncs := template.FuncMap{
+		"ToInstallButtonInput": func(pkgTeaser list.PackageTeaserWithStatus) map[string]any {
+			buttonId := getButtonId(pkgTeaser.PackageName)
+			return map[string]any{
+				"ButtonId":    buttonId,
+				"Swap":        getSwap(buttonId),
+				"PackageName": pkgTeaser.PackageName,
+				"Status":      pkgTeaser.Status,
+			}
+		},
+	}
+	baseTemplate = template.Must(
+		template.New("base.html").Funcs(templateFuncs).ParseFS(embededFs, "templates/layout/base.html"))
+	pkgsPageTmpl = template.Must(template.Must(baseTemplate.Clone()).
+		ParseFS(embededFs, "templates/pages/packages.html", "templates/components/*.html"))
+	supportPageTmpl = template.Must(template.Must(baseTemplate.Clone()).
+		ParseFS(embededFs, "templates/pages/support.html", "templates/components/*.html"))
+	installBtnTmpl = template.Must(template.Must(baseTemplate.Clone()).
+		ParseFS(embededFs, "templates/components/install_button.html"))
+}
+
+func renderInstallButton(w io.Writer, pkgName string, status *client.PackageStatus) {
+	buttonId := getButtonId(pkgName)
+	err := installBtnTmpl.ExecuteTemplate(w, "install_button", &map[string]any{
+		"ButtonId":    buttonId,
+		"Swap":        fmt.Sprintf("outerHTML:#%s", buttonId),
+		"PackageName": pkgName,
+		"Status":      status,
+	})
+	if err != nil {
+		// TODO proper handling
+		fmt.Fprintf(os.Stderr, "An error occurred %v: \n%v\n", pkgName, err)
+	}
+}
+
+func Start(ctx context.Context, support *ServerConfigSupport) error {
 	root, err := fs.Sub(embededFs, "root")
 	if err != nil {
 		return err
 	}
+
+	s := server{
+		messageChan:  make(chan string),
+		pastMessages: []string{},
+		hub:          NewHub(),
+	}
+
+	go s.hub.Run()
+
 	fileServer := http.FileServer(http.FS(root))
 	http.Handle("/static/", fileServer)
 	http.Handle("/favicon.ico", fileServer)
+	http.HandleFunc("/events", s.events)
+	http.HandleFunc("/install", func(w http.ResponseWriter, r *http.Request) {
+		pkgClient := client.FromContext(ctx)
+		pkgName := r.FormValue("packageName")
+		_, err := list.Get(pkgClient, ctx, pkgName)
+		if err != nil && !errors.IsNotFound(err) {
+			// TODO proper error to the client: possibly send down an error div (oop-swapped)
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			return
+		}
+		go func() {
+			status, err := install.NewInstaller(pkgClient).
+				WithStatusWriter(statuswriter.Stderr()).
+				InstallBlocking(ctx, pkgName)
+			if err != nil {
+				// TODO
+				fmt.Fprintf(os.Stderr, "An error occurred installing %v: \n%v\n", pkgName, err)
+			}
+
+			// broadcast the status update to all clients
+			var bf bytes.Buffer
+			renderInstallButton(&bf, pkgName, status)
+			s.hub.Broadcast <- bf.Bytes()
+		}()
+
+		// broadcast the pending button to all clients (note that we do not return any html from the install endpoint
+		var bf bytes.Buffer
+		renderInstallButton(&bf, pkgName, &client.PackageStatus{
+			Status: "Pending",
+		})
+		s.hub.Broadcast <- bf.Bytes()
+	})
+	http.HandleFunc("/uninstall", func(w http.ResponseWriter, r *http.Request) {
+		pkgClient := client.FromContext(ctx)
+		pkgName := r.FormValue("packageName")
+		pkg, err := list.Get(pkgClient, ctx, pkgName)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			return
+		}
+
+		err = uninstall.Uninstall(pkgClient, ctx, pkg)
+		if err != nil {
+			// TODO
+			fmt.Fprintf(os.Stderr, "An error occurred uninstalling %v: \n%v\n", pkgName, err)
+		}
+
+		// broadcast the button depending on status to all clients
+		var bf bytes.Buffer
+		renderInstallButton(&bf, pkgName, nil)
+		s.hub.Broadcast <- bf.Bytes()
+	})
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if support != nil {
-			err := supportTemplate.Execute(w, support)
+			err := supportPageTmpl.Execute(w, support)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "An error occurred rendering the response: \n%v\n", err)
 			}
@@ -65,33 +192,8 @@ func Start(ctx context.Context, support *ServerConfigSupport) error {
 		}
 
 		pkgClient := client.FromContext(ctx)
-		if r.Method == "POST" {
-			pkgName := r.FormValue("packageName")
-			pkg, err := list.Get(pkgClient, ctx, pkgName)
-			if err != nil && !errors.IsNotFound(err) {
-				fmt.Fprintf(os.Stderr, "%v\n", err)
-				return
-			}
-			if pkg != nil {
-				err := uninstall.Uninstall(pkgClient, ctx, pkg)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "An error occurred uninstalling %v: \n%v\n", pkgName, err)
-				}
-				http.Redirect(w, r, "/", http.StatusFound)
-			} else {
-				err := install.NewInstaller(pkgClient).
-					WithStatusWriter(statuswriter.Stderr()).
-					Install(ctx, pkgName)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "An error occurred installing %v: \n%v\n", pkgName, err)
-				}
-				http.Redirect(w, r, "/", http.StatusFound)
-			}
-			return
-		}
-
 		packages, _ := list.GetPackagesWithStatus(pkgClient, ctx, false)
-		err := pkgTemplate.Execute(w, packages)
+		err := pkgsPageTmpl.Execute(w, packages)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "An error occurred rendering the response: \n%v\n", err)
 		}
