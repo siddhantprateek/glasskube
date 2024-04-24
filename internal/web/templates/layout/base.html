@@ -6,11 +6,15 @@
     <link type="text/css" rel="stylesheet" href="/static/bundle/index.min.css" />
     <script src="/static/bundle/index.min.js"></script>
     <script type="text/javascript">
-      // htmx.logAll();
+      htmx.logAll();
     </script>
   </head>
 
-  <body hx-ext="ws,response-targets" ws-connect="/ws" hx-indicator="#indicator" hx-target-error="#error-container">
+  <body
+    hx-ext="json-ws,ws,response-targets"
+    ws-connect="/ws"
+    hx-indicator="#indicator"
+    hx-target-error="#error-container">
     <nav hx-boost="true" class="navbar navbar-expand-lg navbar-dark bg-secondary">
       <div id="indicator" class="progress-container bg-transparent w-100 position-fixed top-0 start-0">
         <div class="htmx-indicator progress-bar bg-primary h-100 w-100"></div>
@@ -96,6 +100,31 @@
           msg.innerText =
             'You have been disconnected for a while. Please refresh this page to make sure you are up to date!';
         }
+      });
+
+      htmx.defineExtension('json-ws', {
+        onEvent: function (name, evt) {
+          if (name === 'htmx:wsBeforeMessage') {
+            const msg = JSON.parse(evt.detail.message);
+            if (msg['trigger']) {
+              htmx.on;
+              htmx.trigger(msg['triggerElement'] || 'body', msg['trigger'], evt.detail);
+              return false; // cancel further execution of this event
+            }
+          }
+        },
+        transformResponse: function (text, xhr, e) {
+          if (!xhr) {
+            // this is a hacky way to only transform responses coming from the websocket
+            try {
+              const msg = JSON.parse(text);
+              if (msg && msg['html']) {
+                return msg['html'];
+              }
+            } catch (e) {}
+          }
+          return text;
+        },
       });
     </script>
   </body>

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -40,7 +41,6 @@ import (
 	"github.com/glasskube/glasskube/api/v1alpha1"
 	"github.com/glasskube/glasskube/internal/cliutils"
 	"github.com/glasskube/glasskube/internal/repo"
-	"github.com/glasskube/glasskube/internal/web/components/pkg_detail_btns"
 	"github.com/glasskube/glasskube/internal/web/components/pkg_overview_btn"
 	"github.com/glasskube/glasskube/internal/web/components/pkg_update_alert"
 	"github.com/glasskube/glasskube/internal/web/handler"
@@ -122,13 +122,23 @@ func (s *server) Client() client.PackageV1Alpha1Client {
 	return s.pkgClient
 }
 
+func (s *server) broadcast(msgType string, value string, triggerElement string) {
+	var jsonMsg bytes.Buffer
+	_ = json.NewEncoder(&jsonMsg).Encode(map[string]string{
+		msgType:          value,
+		"triggerElement": triggerElement,
+	})
+	s.wsHub.Broadcast <- jsonMsg.Bytes()
+}
+
 func (s *server) broadcastPkg(pkg *v1alpha1.Package, status *client.PackageStatus, installedManifest *v1alpha1.PackageManifest) {
 	go func() {
 		var bf bytes.Buffer
 		err := pkg_update_alert.Render(&bf, pkgUpdateAlertTmpl, s.isUpdateAvailable(context.TODO()))
 		checkTmplError(err, fmt.Sprintf("%s (%s)", pkg_update_alert.TemplateId, pkg.Name))
 		if err == nil {
-			s.wsHub.Broadcast <- bf.Bytes()
+			s.broadcast("html", bf.String(), "")
+			// s.wsHub.Broadcast <- bf.Bytes()
 		}
 	}()
 
@@ -142,17 +152,14 @@ func (s *server) broadcastPkg(pkg *v1alpha1.Package, status *client.PackageStatu
 		err := pkg_overview_btn.Render(&bf, pkgOverviewBtnTmpl, pkg, status, installedManifest, updateAvailable)
 		checkTmplError(err, fmt.Sprintf("%s (%s)", pkg_overview_btn.TemplateId, pkg.Name))
 		if err == nil {
-			s.wsHub.Broadcast <- bf.Bytes()
+			s.broadcast("html", bf.String(), "")
+			// s.wsHub.Broadcast <- bf.Bytes()
 		}
 	}()
 
 	go func() {
-		var bf bytes.Buffer
-		err := pkg_detail_btns.Render(&bf, pkgDetailBtnsTmpl, pkg, status, installedManifest, updateAvailable)
-		checkTmplError(err, fmt.Sprintf("%s (%s)", pkg_detail_btns.TemplateId, pkg.Name))
-		if err == nil {
-			s.wsHub.Broadcast <- bf.Bytes()
-		}
+		fmt.Fprintf(os.Stderr, "––– DEBUG ––– sending trigger\n")
+		s.broadcast("trigger", TriggerRefreshPackageDetail, fmt.Sprintf("#pkg-detail-%s", pkg.Name))
 	}()
 }
 
@@ -296,7 +303,7 @@ func (s *server) update(w http.ResponseWriter, r *http.Request) {
 		return
 	} else {
 		delete(s.updateTransactions, utId)
-		addHxTrigger(w, TriggerRefreshPackageDetail)
+		// addHxTrigger(w, TriggerRefreshPackageDetail)
 	}
 }
 
@@ -335,7 +342,7 @@ func (s *server) uninstall(w http.ResponseWriter, r *http.Request) {
 		s.respondAlertAndLog(w, err, "An error occurred uninstalling "+pkgName, "danger")
 		return
 	}
-	addHxTrigger(w, TriggerRefreshPackageDetail)
+	// addHxTrigger(w, TriggerRefreshPackageDetail)
 }
 
 func (s *server) open(w http.ResponseWriter, r *http.Request) {
@@ -384,6 +391,9 @@ func (s *server) packageDetail(w http.ResponseWriter, r *http.Request) {
 	pkgName := mux.Vars(r)["pkgName"]
 	selectedVersion := r.FormValue("selectedVersion")
 	pkg, status, manifest, _, err := describe.DescribePackage(r.Context(), pkgName)
+	if pkg != nil && status != nil {
+		fmt.Fprintf(os.Stderr, "––– DEBUG ––– packageDetailed pkg %s has status %s\n", pkg.Name, status.Status)
+	}
 	autoUpdate := clientutils.AutoUpdateString(pkg, "Disabled")
 	if err != nil {
 		err = fmt.Errorf("An error occurred fetching package details of %v: %w\n", pkgName, err)
@@ -468,7 +478,7 @@ func (s *server) installOrConfigurePackage(w http.ResponseWriter, r *http.Reques
 			s.respondAlertAndLog(w, err, "An error occurred installing "+pkgName, "danger")
 			return
 		}
-		addHxTrigger(w, TriggerRefreshPackageDetail)
+		// addHxTrigger(w, TriggerRefreshPackageDetail)
 	} else {
 		pkg.Spec.Values = values
 		if err := s.pkgClient.Packages().Update(r.Context(), pkg); err != nil {
@@ -794,6 +804,9 @@ func (s *server) initPackageStoreAndController(ctx context.Context) (cache.Store
 						fmt.Fprintf(os.Stderr, "Error fetching manifest for package %v: %v\n", pkg.Name, err)
 						mf = nil
 					}
+					fmt.Fprintf(os.Stderr, "––– DEBUG ––– newObj %s has status %s\n", pkg.Name, client.GetStatusOrPending(&pkg.Status).Status)
+					pkg2, status2, _, _, _ := describe.DescribePackage(ctx, pkg.Name)
+					fmt.Fprintf(os.Stderr, "––– DEBUG ––– describedPkg %s has status %s\n", pkg2.Name, status2.Status)
 					s.broadcastPkg(pkg, client.GetStatusOrPending(&pkg.Status), mf)
 				}
 			},
@@ -832,10 +845,6 @@ func (s *server) isUpdateAvailable(ctx context.Context, packages ...string) bool
 	} else {
 		return !tx.IsEmpty()
 	}
-}
-
-func addHxTrigger(w http.ResponseWriter, trigger string) {
-	w.Header().Add("HX-Trigger", trigger)
 }
 
 func (s *server) respondAlertAndLog(w http.ResponseWriter, err error, wrappingMsg string, alertType string) {

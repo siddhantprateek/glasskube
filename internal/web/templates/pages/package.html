@@ -1,8 +1,9 @@
 {{ define "body" }}
   {{ if .Manifest }}
     <div
+      id="pkg-detail-{{ .Manifest.Name }}"
       class="container-lg mt-2"
-      hx-trigger="htmx:historyRestore from:body, gk:refresh-package-detail from:body"
+      hx-trigger="htmx:historyRestore from:body, gk:refresh-package-detail"
       hx-get="/packages/{{ .Manifest.Name }}"
       hx-select="main"
       hx-target="main">
