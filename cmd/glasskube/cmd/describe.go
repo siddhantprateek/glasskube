@@ -129,7 +129,7 @@ func printEntrypoints(manifest *v1alpha1.PackageManifest) {
 		localUrl += "/"
 		messageParts = append(messageParts, fmt.Sprint("Local: ", localUrl))
 		entrypointMsg := strings.Join(messageParts, ", ")
-		fmt.Fprintf(os.Stderr, " * %s\n", entrypointMsg)
+		fmt.Printf(" * %s\n", entrypointMsg)
 	}
 }
 
@@ -145,11 +145,11 @@ func printDependencies(manifest *v1alpha1.PackageManifest) {
 
 func printRepositories(pkg *v1alpha1.Package, repos []v1alpha1.PackageRepository) {
 	for _, repo := range repos {
-		fmt.Fprintf(os.Stderr, " * %v", repo.Name)
+		fmt.Printf(" * %v", repo.Name)
 		if isInstalledFrom(pkg, repo) {
-			fmt.Fprintln(os.Stderr, " (installed)")
+			fmt.Println(" (installed)")
 		} else {
-			fmt.Fprintln(os.Stderr)
+			fmt.Println()
 		}
 	}
 }
